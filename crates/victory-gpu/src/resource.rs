@@ -1638,6 +1638,91 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     resource(out).host.is_some().then_some(out)
 }
 
+/// The resource for an unordered access view of a texture placed at
+/// `address` with resource description `desc` and view format `view_format`
+/// (0: the resource's own): an existing unordered-access texture at that
+/// address when its format allows the view, else a placed unordered-access
+/// resource made on first use (starting in `UNORDERED_ACCESS` and recorded
+/// in [`TARGETS_AT`] so shader views placed at `address` find its texels
+/// through [`alias_of`]).
+#[cfg(windows)]
+pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -> Option<This> {
+    const DEPTH: u32 = 0x2;
+    const UNORDERED: u32 = 0x4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+
+    if address == 0 {
+        return None;
+    }
+
+    let d = unsafe {
+        desc.as_ptr().cast::<ResourceDesc>().read_unaligned()
+    };
+
+    if d.dimension == BUFFER || d.sample_count > 1 {
+        return None;
+    }
+
+    let own = pc_format(d.format);
+    let wanted = if view_format == 0 {
+        own
+    } else {
+        pc_format(view_format)
+    };
+
+    let mut r = *desc;
+    r[1] = 0;
+    r[13] = 0;
+    r[12] = (r[12] & !DEPTH) | UNORDERED;
+
+    if wanted != own {
+        if family(own) == family(wanted) {
+            r[8] = family(wanted);
+        } else if element(own).is_some()
+            && element(own) == element(wanted)
+        {
+            r[8] = wanted;
+        } else {
+            return None;
+        }
+    }
+
+    let mut map = PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if let Some(&existing) = map.get(&(address, r))
+        && current(existing as This)
+    {
+        return resource(existing as This)
+            .host
+            .is_some()
+            .then_some(existing as This);
+    }
+
+    let uav_desc = unsafe {
+        r.as_ptr().cast::<ResourceDesc>().read_unaligned()
+    };
+
+    let mut out = std::ptr::null();
+
+    let made = create_at_address(
+        std::ptr::null(),
+        address,
+        &uav_desc,
+        UNORDERED_ACCESS,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+
+    if made != S_OK || out.is_null() {
+        return None;
+    }
+
+    map.insert((address, r), out as usize);
+    resource(out).host.is_some().then_some(out)
+}
 pub(crate) extern "system" fn create_placed(
     _: This,
     heap: This,

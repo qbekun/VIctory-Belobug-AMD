@@ -350,6 +350,7 @@ pub(crate) enum View {
     Placed(bool, [u32; 14], [u32; 16]),
 }
 
+
 /// Every distinct view in use; a descriptor holds a tag, an index into it
 /// and the entry's generation, which survive titles copying descriptors as
 /// bytes. A view of a resource lives as long as the resource: when the

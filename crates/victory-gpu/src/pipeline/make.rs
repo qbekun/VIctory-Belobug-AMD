@@ -184,7 +184,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, true);
-        wait(p, crate::frame::current());
+        if p.graphics.is_none() && compute_waits() {
+            p.make();
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -369,4 +373,14 @@ mod tests {
         }
         assert!(matches!(p.made.get(), Some(None)));
     }
+}
+
+
+/// Wait for compute pipelines even after the frame budget expires.
+fn compute_waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT")
+            .is_none_or(|v| v != "0")
+    })
 }

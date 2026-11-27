@@ -61,3 +61,64 @@ mod tests {
         assert_eq!(MeshLayout { max_vertices: 257, ..triangle() }.allocation(u64::MAX), None);
     }
 }
+
+    
+/// Conservative reservation for a triangle mesh dispatch with a separate
+/// indexed draw argument for each workgroup and an overflow/status word.
+/// Does not include D3D12 allocation alignment or primitive attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshReservation {
+    pub geometry: MeshAllocation,
+    pub argument_bytes: u64,
+    pub status_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl MeshLayout {
+    pub fn reservation(self, budget: u64) -> Option<MeshReservation> {
+        let geometry = self.allocation(budget)?;
+        let groups = self.groups.into_iter().try_fold(1u64, |a, b| a.checked_mul(u64::from(b)))?;
+        let argument_bytes = groups.checked_mul(20)?;
+        let status_bytes = 4;
+        let total_bytes = geometry.bytes.checked_add(argument_bytes)?.checked_add(status_bytes)?;
+        (total_bytes <= budget).then_some(MeshReservation {
+            geometry, argument_bytes, status_bytes, total_bytes,
+        })
+    }
+
+    /// Fixed-capacity disjoint slots, before a GPU compaction pass.
+    pub fn group_offsets(self, group: [u32; 3]) -> Option<(u64, u64)> {
+        self.allocation(u64::MAX)?;
+        if group.into_iter().zip(self.groups).any(|(i, n)| i >= n) {
+            return None;
+        }
+        let [x, y, z] = group.map(u64::from);
+        let [gx, gy, _] = self.groups.map(u64::from);
+        let linear = (z * gy + y) * gx + x;
+        Some((linear * u64::from(self.max_vertices),
+              linear * u64::from(self.max_primitives) * 3))
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+    fn layout() -> MeshLayout {
+        MeshLayout { groups: [2, 3, 2], max_vertices: 4, max_primitives: 2, vertex_stride: 16 }
+    }
+    #[test]
+    fn budgets_geometry_and_indirect_arguments() {
+        let r = layout().reservation(u64::MAX).unwrap();
+        assert_eq!(r.geometry.bytes, 1056);
+        assert_eq!(r.argument_bytes, 240);
+        assert_eq!(r.total_bytes, 1300);
+        assert!(layout().reservation(1299).is_none());
+        assert_eq!(layout().reservation(1300), Some(r));
+    }
+    #[test]
+    fn disjoint_three_dimensional_group_slots() {
+        assert_eq!(layout().group_offsets([0, 0, 0]), Some((0, 0)));
+        assert_eq!(layout().group_offsets([1, 2, 1]), Some((44, 66)));
+        assert_eq!(layout().group_offsets([2, 0, 0]), None);
+    }
+}

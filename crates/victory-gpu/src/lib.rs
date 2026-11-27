@@ -62,6 +62,7 @@ mod port_journal;
 #[cfg(windows)]
 mod land;
 pub mod list;
+pub mod mesh_fallback;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

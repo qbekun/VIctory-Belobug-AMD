@@ -1662,4 +1662,65 @@ void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
         assert_eq!(result[0], expected);
         assert_eq!(result[1], vec![0, 1, 2, 3, 4, 5]);
     }
+
+    // Test-only bridge: compute-generated geometry is read back and uploaded
+    // through the existing draw fixture. This is intentionally not the runtime path.
+    #[test]
+    #[ignore = "requires hardware D3D12 SM 6.6 and dxc.exe"]
+    fn mesh_fallback_compute_rasterization() {
+        let dxc = std::env::var_os("VICTORY_PC_DXC")
+            .map(std::path::PathBuf::from)
+            .or_else(|| Validator::default_path().map(|p| p.with_file_name("dxc.exe")))
+            .expect("set VICTORY_PC_DXC to dxc.exe");
+        let dir = std::env::temp_dir().join(format!("victory-mesh-raster-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compile = |profile: &str, src: &str| {
+            let input = dir.join(format!("{profile}.hlsl"));
+            let output = dir.join(format!("{profile}.dxil"));
+            let root = dir.join(format!("{profile}.rootsig"));
+            std::fs::write(&input, src).unwrap();
+            let status = std::process::Command::new(&dxc)
+                .args(["-nologo", "-T", profile, "-E", "main", "-Fo"])
+                .arg(&output).arg("-Frs").arg(&root).arg(&input)
+                .status().expect("launch dxc");
+            assert!(status.success(), "DXC rejected {profile}");
+            (std::fs::read(output).unwrap(), std::fs::read(root).unwrap())
+        };
+        let (cs, cs_root) = compile("cs_6_6", CS);
+        let (vs, vs_root) = compile("vs_6_6", r#"
+[RootSignature("RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)")]
+float4 main(float4 position : POSITION) : SV_Position { return position; }
+"#);
+        let (ps, _) = compile("ps_6_6", r#"
+[RootSignature("RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)")]
+float4 main() : SV_Target { return float4(1, 0, 0, 1); }
+"#);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let host = Host::new(false).expect("hardware D3D12 device");
+        eprintln!("mesh raster fixture adapter: {:?}", host.adapter_name());
+        let cr: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &cs_root) }
+            .expect("compute root signature");
+        let cp = host.compute_pipeline_with(&cr, &cs).expect("compute pipeline");
+        let data = host.dispatch(&cr, &cp, &Dispatch {
+            roots: vec![], views: &[View::RawUav(12), View::RawUav(3)],
+            samplers: &[], groups: [1, 1, 1],
+        }).expect("geometry dispatch");
+        assert_eq!(data[1], vec![0, 1, 2]);
+        let vertices: Vec<f32> = data[1].iter().flat_map(|&i| {
+            let start = i as usize * 4;
+            data[0][start..start + 4].iter().copied().map(f32::from_bits)
+        }).collect();
+        let gr: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &vs_root) }
+            .expect("graphics root signature");
+        let gp = host.pipeline_with(&gr, &vs, &ps).expect("vertex/pixel pipeline");
+        let pixels = host.draw(&gr, &gp, &Draw {
+            roots: vec![], textures: &[], samplers: &[],
+            vertices: &vertices, stride: 16, size: (32, 32), mesh_groups: 0,
+        }).expect("rasterization");
+        assert_eq!(pixels.len(), 1024);
+        assert_eq!(pixels[16 * 32 + 16], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(pixels[0], [0.0; 4]);
+        let red = pixels.iter().filter(|&&p| p == [1.0, 0.0, 0.0, 1.0]).count();
+        assert!((100..=160).contains(&red), "unexpected triangle coverage: {red}");
+    }
 }

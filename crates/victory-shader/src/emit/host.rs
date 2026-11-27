@@ -785,6 +785,17 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_with_compute(root, pso, d, None)
+    }
+
+    /// Test-only compute-to-indexed-draw path. Geometry stays in default-heap buffers.
+    fn draw_with_compute(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        compute: Option<(&ID3D12RootSignature, &ID3D12PipelineState)>,
+    ) -> Result<Vec<[f32; 4]>, String> {
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -870,7 +881,7 @@ impl Host {
             let views: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: d.textures.len().max(1) as u32,
+                    NumDescriptors: d.textures.len().max(if compute.is_some() { 2 } else { 1 }) as u32,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     ..Default::default()
                 })
@@ -976,6 +987,44 @@ impl Host {
                 Some(vb)
             };
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(sampler_heap.clone())]);
+            let generated = if let Some((cr, cp)) = compute {
+                let mut buffers = Vec::new();
+                for (i, words) in [12u32, 3].into_iter().enumerate() {
+                    let mut desc = buf_desc(u64::from(words) * 4);
+                    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                    let buf = make(
+                        D3D12_HEAP_TYPE_DEFAULT, &desc,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None,
+                    )?;
+                    let mut at = views.GetCPUDescriptorHandleForHeapStart();
+                    at.ptr += i * view_size;
+                    let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_TYPELESS,
+                        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_UAV {
+                                NumElements: words,
+                                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                ..Default::default()
+                            },
+                        },
+                    };
+                    dev.CreateUnorderedAccessView(&buf, None, Some(&uav), at);
+                    buffers.push(buf);
+                }
+                list.SetPipelineState(cp);
+                list.SetComputeRootSignature(cr);
+                list.Dispatch(1, 1, 1);
+                // The transitions order UAV writes before input assembler reads.
+                list.ResourceBarrier(&[
+                    transition(&buffers[0], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
+                    transition(&buffers[1], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_INDEX_BUFFER),
+                ]);
+                list.SetPipelineState(pso);
+                Some(buffers)
+            } else { None };
             list.SetGraphicsRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
@@ -1021,7 +1070,17 @@ impl Host {
                     }]),
                 );
             }
-            if d.mesh_groups > 0 {
+            if let Some(buffers) = &generated {
+                list.IASetVertexBuffers(0, Some(&[D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: buffers[0].GetGPUVirtualAddress(),
+                    SizeInBytes: 48, StrideInBytes: 16,
+                }]));
+                list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: buffers[1].GetGPUVirtualAddress(),
+                    SizeInBytes: 12, Format: DXGI_FORMAT_R32_UINT,
+                }));
+                list.DrawIndexedInstanced(3, 1, 0, 0, 0);
+            } else if d.mesh_groups > 0 {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
@@ -1717,6 +1776,57 @@ float4 main() : SV_Target { return float4(1, 0, 0, 1); }
             roots: vec![], textures: &[], samplers: &[],
             vertices: &vertices, stride: 16, size: (32, 32), mesh_groups: 0,
         }).expect("rasterization");
+        assert_eq!(pixels.len(), 1024);
+        assert_eq!(pixels[16 * 32 + 16], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(pixels[0], [0.0; 4]);
+        let red = pixels.iter().filter(|&&p| p == [1.0, 0.0, 0.0, 1.0]).count();
+        assert!((100..=160).contains(&red), "unexpected triangle coverage: {red}");
+    }
+
+    // Geometry remains on GPU between dispatch and indexed drawing.
+    #[test]
+    #[ignore = "requires hardware D3D12 SM 6.6 and dxc.exe"]
+    fn mesh_fallback_gpu_resident_rasterization() {
+        let dxc = std::env::var_os("VICTORY_PC_DXC")
+            .map(std::path::PathBuf::from)
+            .or_else(|| Validator::default_path().map(|p| p.with_file_name("dxc.exe")))
+            .expect("set VICTORY_PC_DXC to dxc.exe");
+        let dir = std::env::temp_dir().join(format!("victory-mesh-resident-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compile = |profile: &str, src: &str| {
+            let input = dir.join(format!("{profile}.hlsl"));
+            let output = dir.join(format!("{profile}.dxil"));
+            let root = dir.join(format!("{profile}.rootsig"));
+            std::fs::write(&input, src).unwrap();
+            let status = std::process::Command::new(&dxc)
+                .args(["-nologo", "-T", profile, "-E", "main", "-Fo"])
+                .arg(&output).arg("-Frs").arg(&root).arg(&input)
+                .status().expect("launch dxc");
+            assert!(status.success(), "DXC rejected {profile}");
+            (std::fs::read(output).unwrap(), std::fs::read(root).unwrap())
+        };
+        let (cs, cs_root) = compile("cs_6_6", CS);
+        let (vs, vs_root) = compile("vs_6_6", r#"
+[RootSignature("RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)")]
+float4 main(float4 position : POSITION) : SV_Position { return position; }
+"#);
+        let (ps, _) = compile("ps_6_6", r#"
+[RootSignature("RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)")]
+float4 main() : SV_Target { return float4(1, 0, 0, 1); }
+"#);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let host = Host::new(false).expect("hardware D3D12 device");
+        eprintln!("mesh raster fixture adapter: {:?}", host.adapter_name());
+        let cr: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &cs_root) }
+            .expect("compute root signature");
+        let cp = host.compute_pipeline_with(&cr, &cs).expect("compute pipeline");
+        let gr: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &vs_root) }
+            .expect("graphics root signature");
+        let gp = host.pipeline_with(&gr, &vs, &ps).expect("vertex/pixel pipeline");
+        let pixels = host.draw_with_compute(&gr, &gp, &Draw {
+            roots: vec![], textures: &[], samplers: &[],
+            vertices: &[], stride: 16, size: (32, 32), mesh_groups: 0,
+        }, Some((&cr, &cp))).expect("rasterization");
         assert_eq!(pixels.len(), 1024);
         assert_eq!(pixels[16 * 32 + 16], [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(pixels[0], [0.0; 4]);

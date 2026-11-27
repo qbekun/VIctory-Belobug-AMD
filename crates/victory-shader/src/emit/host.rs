@@ -1595,3 +1595,71 @@ impl Host {
         }
     }
 }
+
+
+#[cfg(test)]
+mod mesh_fallback_gpu_tests {
+    use super::*;
+    use super::super::validator::Validator;
+
+    // This fixture writes two independent triangles into bounded raw UAVs.
+    // It does not depend on native mesh shaders or the title's shader ISA.
+    const CS: &str = r#"
+[RootSignature("RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)")]
+[numthreads(3, 1, 1)]
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    RWByteAddressBuffer vertices = ResourceDescriptorHeap[0];
+    RWByteAddressBuffer indices = ResourceDescriptorHeap[1];
+    float2 xy = lane == 0 ? float2(-0.5, -0.5) :
+                lane == 1 ? float2(0.5, -0.5) : float2(0.0, 0.5);
+    uint index = group.x * 3 + lane;
+    vertices.Store4(index * 16, asuint(float4(xy, 0.0, 1.0)));
+    indices.Store(index * 4, index);
+}
+"#;
+
+    #[test]
+    #[ignore = "requires hardware D3D12 SM 6.6 and dxc.exe"]
+    fn mesh_fallback_compute_geometry() {
+        let dxc = std::env::var_os("VICTORY_PC_DXC")
+            .map(std::path::PathBuf::from)
+            .or_else(|| Validator::default_path().map(|p| p.with_file_name("dxc.exe")))
+            .expect("set VICTORY_PC_DXC to dxc.exe");
+        let dir = std::env::temp_dir().join(format!("victory-mesh-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("geometry.hlsl");
+        let output = dir.join("geometry.dxil");
+        let root_file = dir.join("geometry.rootsig");
+        std::fs::write(&source, CS).unwrap();
+        let status = std::process::Command::new(&dxc)
+            .args(["-nologo", "-T", "cs_6_6", "-E", "main", "-Fo"])
+            .arg(&output)
+            .arg("-Frs")
+            .arg(&root_file)
+            .arg(&source)
+            .status()
+            .expect("launch dxc");
+        assert!(status.success(), "DXC rejected geometry fixture");
+        let dxil = std::fs::read(output).unwrap();
+        let root_bytes = std::fs::read(root_file).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let host = Host::new(false).expect("hardware D3D12 device");
+        eprintln!("mesh fallback fixture adapter: {:?}", host.adapter_name());
+        let root: ID3D12RootSignature = unsafe {
+            host.device.CreateRootSignature(0, &root_bytes)
+        }.expect("geometry root signature");
+        let pso = host.compute_pipeline_with(&root, &dxil).expect("geometry compute pipeline");
+        let result = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![],
+            views: &[View::RawUav(24), View::RawUav(6)],
+            samplers: &[],
+            groups: [2, 1, 1],
+        }).expect("geometry dispatch");
+        let one = [-0.5f32, -0.5, 0.0, 1.0, 0.5, -0.5, 0.0, 1.0, 0.0, 0.5, 0.0, 1.0];
+        let expected: Vec<u32> = one.into_iter().chain(one).map(f32::to_bits).collect();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], expected);
+        assert_eq!(result[1], vec![0, 1, 2, 3, 4, 5]);
+    }
+}
